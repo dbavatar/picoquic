@@ -189,6 +189,7 @@ int picoquic_open_server_sockets(picoquic_server_sockets_t * sockets, int port)
 {
     int ret = 0;
     const int sock_af[] = { AF_INET6, AF_INET };
+    int on = 1;
 
     for (int i = 0; i < PICOQUIC_NB_SERVER_SOCKETS; i++)
     {
@@ -208,15 +209,22 @@ int picoquic_open_server_sockets(picoquic_server_sockets_t * sockets, int port)
         else
         {
 #ifndef WIN32
-        	if (sock_af[i] == AF_INET6) {
-        		int val = 1;
+        	if (sock_af[i] == AF_INET6)
+        	{
         		ret = setsockopt(sockets->s_socket[i], IPPROTO_IPV6, IPV6_V6ONLY,
-        				&val, sizeof(val));
+        				&on, sizeof(on));
         		if (ret)
         			return ret;
         	}
 #endif
-            ret = bind_to_port(sockets->s_socket[i], sock_af[i], port);
+        	if (sock_af[i] == AF_INET)
+        		ret = setsockopt(sockets->s_socket[i], IPPROTO_IP, IP_PKTINFO, &on, sizeof(on));
+        	else
+        		ret = setsockopt(sockets->s_socket[i], IPPROTO_IPV6, IPV6_RECVPKTINFO, &on, sizeof(on));
+
+        	if (ret)
+        		return ret;
+        	ret = bind_to_port(sockets->s_socket[i], sock_af[i], port);
         }
     }
 
@@ -275,7 +283,8 @@ int do_select(SOCKET_TYPE * sockets, int nb_sockets,
     socklen_t * from_length,
     uint8_t * buffer, int buffer_max,
     int64_t delta_t,
-    uint64_t * current_time)
+    uint64_t * current_time,
+	void *pktinfo, int *have_pktinfo)
 {
 
     fd_set   readfds;
@@ -332,9 +341,26 @@ int do_select(SOCKET_TYPE * sockets, int nb_sockets,
             {
                 /* Read the incoming response */
                 *from_length = sizeof(struct sockaddr_storage);
+#ifdef WIN32
                 bytes_recv = recvfrom(sockets[i], (char*)buffer, buffer_max, 0,
-                    (struct sockaddr *)addr_from, from_length);
+                		(struct sockaddr *)addr_from, from_length);
+#else
+                //DB This could work on windows.
+                struct iovec iovec;
+                struct msghdr msg;
+                char msg_control[1024];
 
+                iovec.iov_base = (void *)buffer;
+                iovec.iov_len = buffer_max;
+                msg.msg_name = addr_from;
+                msg.msg_namelen = *from_length;
+                msg.msg_iov = &iovec;
+                msg.msg_iovlen = 1;
+                msg.msg_control = msg_control;
+                msg.msg_controllen = sizeof(msg_control);
+                msg.msg_flags = 0;
+                bytes_recv = recvmsg(sockets[i],  &msg, 0);
+#endif
                 if (bytes_recv <= 0)
                 {
 #ifdef WIN32
@@ -352,6 +378,25 @@ int do_select(SOCKET_TYPE * sockets, int nb_sockets,
                 }
                 else
                 {
+                	struct cmsghdr* cmsg;
+                	*have_pktinfo = 0;
+                	for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != 0; cmsg = CMSG_NXTHDR(&msg, cmsg))
+                	{
+                		if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO)
+                		{
+                			struct in_pktinfo *pktinfo2 = (struct in_pktinfo*) CMSG_DATA(cmsg);
+                			memcpy(pktinfo, CMSG_DATA(cmsg), sizeof(struct in_pktinfo));
+                			*have_pktinfo = 1;
+                			break;
+                		}
+                		if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO)
+                		{
+                			memcpy(pktinfo, CMSG_DATA(cmsg), sizeof(struct in6_pktinfo));
+                			*have_pktinfo = 1;
+                			break;
+                		}
+                	}
+
                     break;
                 }
             }
@@ -366,18 +411,54 @@ int do_select(SOCKET_TYPE * sockets, int nb_sockets,
 int send_to_server_sockets(
     picoquic_server_sockets_t * sockets, 
     struct sockaddr * addr_dest, socklen_t addr_length,
-    const char * bytes, int length)
+    const char * bytes, int length, void *pktinfo_in, int have_pktinfo)
 {
-    /* Linux uses a single socket for V6 and V4, Windows uses 2 */
-#ifdef WIN32
     int socket_index = (addr_dest->sa_family == AF_INET) ? 1 : 0;
-#else
-    const int socket_index = 0;
-#endif
+    struct msghdr msg;
+    struct iovec iovec;
 
-    int sent = sendto(sockets->s_socket[socket_index], bytes, length, 0,
-        addr_dest, addr_length);
+    struct cmsghdr *cmsg;
+    char msg_control[1024];
+    int sent;
 
+    if (have_pktinfo)
+    {
+    	iovec.iov_base = (void *)bytes;
+    	iovec.iov_len = length;
+    	msg.msg_flags = 0;
+    	msg.msg_iov = &iovec;
+    	msg.msg_iovlen = 1;
+    	msg.msg_name = addr_dest;
+    	msg.msg_namelen = addr_length;
+    	msg.msg_control = msg_control;
+    	if (addr_dest->sa_family == AF_INET)
+    		msg.msg_controllen = CMSG_SPACE(sizeof(struct in_pktinfo));
+    	else
+    		msg.msg_controllen = CMSG_SPACE(sizeof(struct in6_pktinfo));
+
+    	cmsg = CMSG_FIRSTHDR(&msg);
+    	cmsg->cmsg_level = addr_dest->sa_family == AF_INET ? IPPROTO_IP : IPPROTO_IPV6;
+    	cmsg->cmsg_type = IP_PKTINFO;
+    	cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
+
+    	if (addr_dest->sa_family == AF_INET)
+    	{
+    		struct in_pktinfo *pktinfo = (struct in_pktinfo*) CMSG_DATA(cmsg);
+    		pktinfo->ipi_spec_dst = ((struct in_pktinfo*)pktinfo_in)->ipi_addr;
+    		pktinfo->ipi_ifindex = 0;
+    	}
+    	else
+    	{
+    		struct in6_pktinfo *pktinfo2 =  (struct in6_pktinfo*) CMSG_DATA(cmsg);
+    		*pktinfo2 = *((struct in6_pktinfo *) pktinfo_in);
+    		pktinfo2->ipi6_ifindex = 0;
+    	}
+
+    	sent = sendmsg(sockets->s_socket[socket_index], &msg, 0);
+    }
+    else
+    	sent = sendto(sockets->s_socket[socket_index], bytes, length, 0,
+    	    	addr_dest, addr_length);
     return sent;
 }
 
@@ -605,6 +686,12 @@ int quic_server(const char * server_name, int server_port,
 	picoquic_stateless_packet_t * sp;
     int64_t delay_max = 10000000;
 
+    union  {
+    	struct in_pktinfo in_pktinfo;
+    	struct in6_pktinfo in6_pktinfo;
+    } pktinfo;
+    int have_pktinfo = 0;
+
     /* Open a UDP socket */
     ret = picoquic_open_server_sockets(&server_sockets, server_port);
 
@@ -633,7 +720,8 @@ int quic_server(const char * server_name, int server_port,
         bytes_recv = do_select(server_sockets.s_socket, PICOQUIC_NB_SERVER_SOCKETS,
             &addr_from, &from_length,
             buffer, sizeof(buffer), 
-            picoquic_get_next_wake_delay(qserver, current_time, delay_max), &current_time);
+            picoquic_get_next_wake_delay(qserver, current_time, delay_max), &current_time,
+			&pktinfo, &have_pktinfo);
 
         if (bytes_recv != 0)
         {
@@ -689,7 +777,8 @@ int quic_server(const char * server_name, int server_port,
                 {
                     int sent = send_to_server_sockets(&server_sockets,
                         (struct sockaddr *) &addr_from, from_length,
-                        (const char *)sp->bytes, (int)sp->length);
+                        (const char *)sp->bytes, (int)sp->length,
+						&pktinfo, have_pktinfo);
 
                     printf("Sending stateless packet, %d bytes\n", sent);
                     picoquic_delete_stateless_packet(sp);
@@ -731,7 +820,8 @@ int quic_server(const char * server_name, int server_port,
 
                                 int sent = send_to_server_sockets(&server_sockets,
                                     peer_addr, peer_addr_len,
-                                    (const char *)send_buffer, (int)send_length);
+                                    (const char *)send_buffer, (int)send_length,
+									&pktinfo, have_pktinfo);
 
                                 if (cnx_server != NULL && just_once != 0)
                                 {
@@ -1018,6 +1108,12 @@ int quic_client(const char * ip_address_text, int server_port, uint32_t proposed
     const char * sni = NULL;
     int64_t delay_max = 10000000;
 
+    union {
+    	struct in_pktinfo in_pktinfo;
+    	struct in6_pktinfo in6_pktinfo;
+    } pktinfo;
+    int have_pktinfo;
+
     memset(&callback_ctx, 0, sizeof(picoquic_first_client_callback_ctx_t));
     callback_ctx.demo_stream = test_scenario;
     callback_ctx.nb_demo_streams = test_scenario_nb;
@@ -1184,7 +1280,7 @@ int quic_client(const char * ip_address_text, int server_port, uint32_t proposed
         bytes_recv = do_select(&fd, 1, &packet_from, &from_length,
             buffer, sizeof(buffer), 
             picoquic_get_next_wake_delay(qclient, current_time, delay_max), 
-            &current_time);
+            &current_time, &pktinfo, &have_pktinfo);
 
         if (bytes_recv != 0)
         {
